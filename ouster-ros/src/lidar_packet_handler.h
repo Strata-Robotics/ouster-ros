@@ -409,23 +409,35 @@ class LidarPacketHandler {
         return true;
     }
 
+    // Stamps each scan with its own start: the earliest of its packets' arrival times,
+    // each extrapolated back by its column index. The scan batcher completes a scan on
+    // its last packet, so extrapolating "the next scan" from the completing packet, as
+    // upstream does, gives the finished scan's start and stamps every scan ~100 ms early.
     bool lidar_handler_ros_time(const ouster::sdk::core::PacketFormat& pf,
                                 const ouster::sdk::core::LidarPacket& lidar_packet,
                                 ouster::sdk::core::LidarScan& lidar_scan) {
         auto packet_receive_time = rclcpp::Time(lidar_packet.host_timestamp);
-
-        if (!lidar_handler_ros_time_frame_ts) {
-            lidar_handler_ros_time_frame_ts = extrapolate_frame_ts(
-                pf, lidar_packet.buf.data(),
-                packet_receive_time);  // first point cloud time
+        const uint8_t* buf = lidar_packet.buf.data();
+        const int64_t f_id = pf.frame_id(buf);
+        const auto est = extrapolate_frame_ts(pf, buf, packet_receive_time);
+        if (f_id != ros_time_cur_frame_id) {
+            ros_time_prev_frame_id = ros_time_cur_frame_id;
+            ros_time_prev_frame_ts = ros_time_cur_frame_ts;
+            ros_time_cur_frame_id = f_id;
+            ros_time_cur_frame_ts = est;
+        } else if (est < ros_time_cur_frame_ts) {
+            ros_time_cur_frame_ts = est;
         }
 
         if (!(*scan_batcher)(lidar_packet, lidar_scan)) return false;
         lidar_scan_estimated_ts = compute_scan_ts(lidar_scan.timestamp());
-        lidar_scan_estimated_msg_ts = lidar_handler_ros_time_frame_ts.value();
-        // set time for next point cloud msg
-        lidar_handler_ros_time_frame_ts = extrapolate_frame_ts(
-            pf, lidar_packet.buf.data(), packet_receive_time);
+        if (lidar_scan.frame_id == ros_time_cur_frame_id) {
+            lidar_scan_estimated_msg_ts = ros_time_cur_frame_ts;
+        } else if (lidar_scan.frame_id == ros_time_prev_frame_id) {
+            lidar_scan_estimated_msg_ts = ros_time_prev_frame_ts;
+        } else {
+            lidar_scan_estimated_msg_ts = est;
+        }
         return true;
     }
 
@@ -448,7 +460,12 @@ class LidarPacketHandler {
     uint64_t lidar_scan_estimated_ts;
     rclcpp::Time lidar_scan_estimated_msg_ts;
 
-    std::optional<rclcpp::Time> lidar_handler_ros_time_frame_ts;
+    // The frame being batched and the one before it, each with its earliest
+    // extrapolated start, because a scan can complete on its successor's first packet.
+    int64_t ros_time_cur_frame_id = -1;
+    int64_t ros_time_prev_frame_id = -1;
+    rclcpp::Time ros_time_cur_frame_ts;
+    rclcpp::Time ros_time_prev_frame_ts;
 
     int last_scan_last_nonzero_idx = -1;
     uint64_t last_scan_last_nonzero_value = 0;
